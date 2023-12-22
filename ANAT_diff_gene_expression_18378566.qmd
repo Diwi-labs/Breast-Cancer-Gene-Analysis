@@ -1,0 +1,173 @@
+---
+title: "ANAT40040_Differential_Gene_Expression"
+format: pdf
+editor: visual
+---
+
+## Imports
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(purrr)
+library(forcats)
+library(clusterProfiler)
+library(stats)
+library(data.table) # used to rotate the datarfame as I thought I was going to export it
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(EnhancedVolcano)
+library(survival)
+```
+
+## Importing data
+Unfortunately not all of the files have the same patients, we therefore will need to engage in some data pruning before we can use all 3 files together in analysis
+
+```{r}
+# move working directory to where the data is stored and where I want to store files and results related
+# to the project
+setwd("/Users/diarmuidegan/Documents/ANAT40040/gene_analysis")
+
+# loading data
+rnaseq = read.delim("~/Documents/ANAT40040/gene_analysis/brca_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt")
+clinical = read.delim("~/Documents/ANAT40040/gene_analysis/brca_tcga_pan_can_atlas_2018/data_clinical_patient.txt")
+cna <- read.delim("~/Documents/ANAT40040/gene_analysis/brca_tcga_pan_can_atlas_2018/data_cna.txt")
+
+
+
+# not all patients are in the both datasets
+
+mc1 <- c(setdiff(names(cna), names(rnaseq)))
+mc2 <- c(setdiff(names(rnaseq), names(cna)))
+
+rnaseq <- rnaseq[, !names(rnaseq) %in% mc2]
+cna <- cna[, !names(cna) %in% mc1]
+
+# Made this list manually as it will probably take less time than regex
+# names taken from above lists and extra numbers removed
+mc3 <- gsub("\\.", "-", c("TCGA.AC.A5EI", "TCGA.C8.A9FZ", "TCGA.A2.A0CZ" ,"TCGA.A7.A4SC", "TCGA.A8.A07C" ,"TCGA.AN.A0G0" ,"TCGA.AR.A0TU", "TCGA.AR.A1AT", "TCGA.B6.A0I6", "TCGA.B6.A0I8", "TCGA.BH.A0B1", "TCGA.BH.A0B8", "TCGA.BH.A0HF" ,"TCGA.BH.A0HL", "TCGA.BH.A0HN", "TCGA.E2.A1LS"))
+clinical <- clinical[!clinical$X.Patient.Identifier %in% mc3, ]
+
+
+# now checking if the datasets have the same order of patients 
+same_order_cols <- function(x,y) {
+  for (i in names(x)) {
+    if (!(i %in% names(y))) {
+      print('Warning: Column names are not the same')
+      break
+    }  
+    else if(i==tail(names(y),n=1)) {
+      print('Column names are identical')
+    }
+  }
+}
+
+same_order_cols(rnaseq,cna)
+same_order_cols(cna,rnaseq) # luckily they in the same order are so we can proceed
+```
+
+
+## Differential Gene Expression
+We shall now use the DESeq2 library to perform differential expression analysis between the two groups of patients : HER2 positive and not positive
+```{r}
+# creating labels for differential gene analysis
+Her2 <- character(ncol(rnaseq)-2)
+
+for (i in 1:(ncol(rnaseq) - 2)) {
+  if (as.numeric(cna[which(cna$Hugo_Symbol == "ERBB2"), i+2]) > 0) {
+    Her2[i] <- "HER2"
+  } else {
+    Her2[i] <- "not_HER2"
+  }
+}
+
+Her2 <- factor(Her2 )
+
+# creating the count matrix
+assay = as.matrix(rnaseq[,-c(1,2)]) # need a matrix with positive integers only, no gene labels
+assay[is.na(assay)] = 0  
+assay[assay<0] = 0
+
+dds <- DESeqDataSetFromMatrix(countData = round(assay), DataFrame(Her2), design = ~ Her2)
+dds$Her2 <- factor(dds$Her2, levels = c("not_HER2", "HER2"))
+
+# identifing differentially expressed genes
+dds <- DESeq(dds)
+
+deseq_res <- results(dds)
+
+# adding back the gene labels now that we are finished with deseq
+deseq_res <- as.data.frame(deseq_res)
+deseq_res$Entrez_Gene_Id <- rnaseq$Entrez_Gene_Id
+deseq_res$Hugo_Symbol <- rnaseq$Hugo_Symbol
+deseq_res <- na.omit(deseq_res)
+
+deseq_res_pordered <- deseq_res[order(deseq_res$padj),]
+
+pvalues_99 <- deseq_res_pordered[deseq_res_pordered$padj < 0.01, ]
+
+
+# ordering by fold change
+deseq_res_fc_ordered <- deseq_res[order(deseq_res$log2FoldChange),]
+fc_values <- deseq_res_pordered[deseq_res_fc_ordered$padj < 0.01, ]
+```
+
+
+## Creating a PCA plot to see if the two groups can be easily identified
+```{r}
+# Carrying out PCA
+rld <- vst(dds, blind=FALSE) # stabalises the variance for the different variables
+
+pc = prcomp(assay(rld))
+
+
+plot(pc$rotation[, 1], pc$rotation[, 2], col = 1 + as.numeric(dds$Her2), pch = 19, 
+     xlab = "PC2", ylab = "PC3", main = "PCA Plot of two most explanitory PC's")
+legend("topright", legend = unique(dds$Her2), col = 1 + as.numeric(unique(dds$Her2)), pch = 19, title = "Her2 Status")
+
+```
+
+## Performing gene oncology analysis in order to more easily identify differentially expressed gene funcitons
+```{r}
+# perfroming analysis on only the most significantly expressed genes
+significant_subset <- deseq_res[deseq_res$log2FoldChange > 0.5 & deseq_res$padj < 0.01,]
+significant_subset <- significant_subset[!duplicated(significant_subset$Entrez_Gene_Id), ]
+rownames(significant_subset) <- significant_subset$Entrez_Gene_Id
+
+
+gene_ids <- significant_subset$Entrez_Gene_Id
+GO_results <- enrichGO(gene = gene_ids, OrgDb = "org.Hs.eg.db", keyType = "ENTREZID", ont = "BP")
+fit <- plot(barplot(GO_results, showCategory = 20))
+
+GO_results <- enrichGO(gene = gene_ids, OrgDb = "org.Hs.eg.db", keyType = "ENTREZID", ont = "MF")
+fit <- plot(barplot(GO_results, showCategory = 10))
+
+```
+
+## Creating a volcano plot of differentiually expressed genes
+```{r}
+EnhancedVolcano(deseq_res, x="log2FoldChange", y="padj", lab = deseq_res$Hugo_Symbol)
+```
+
+## Cox regression to analyse differential durvival
+```{r}
+# using cox regression to compare survival rates between groups of HER+ and not
+# following https://www.youtube.com/watch?v=TrS2M5imOt8
+clinical <- clinical[-c(1:4),] # removing non necessary rows
+clinical$HER2 <- Her2
+clinical$Overall.Survival..Months. <- as.numeric(as.character(clinical$Overall.Survival..Months.))
+
+# converting the survival outcome to binary numeric type
+clinical$Overall.Survival.Status <- ifelse(clinical$Overall.Survival.Status == "0:LIVING", 0, 1)
+
+attach(clinical)
+
+cox.mod <- coxph(Surv(Overall.Survival..Months., Overall.Survival.Status) ~ HER2)
+```
+
+
+
+
